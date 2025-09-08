@@ -13,25 +13,80 @@ import {
   Sliders,
   ArrowLeft,
   Download,
-  Eye
+  Eye,
+  Edit3,
+  Check,
+  X
 } from "lucide-react"
 import Link from "next/link"
 
 interface DetectedObject {
   id: string
-  label: string
-  confidence: number
   bbox: [number, number, number, number] // [x, y, width, height]
-  croppedImageUrl: string
+  description: string
+  confidence: number
+  croppedImageUrl?: string
+}
+
+interface SegmentationResponse {
+  success: boolean
+  message: string
+  results: Array<{
+    bbox: [number, number, number, number]
+    description: string
+    confidence: string
+  }>
+  raw_output: string
+  debug_info: {
+    text_length: number
+    text_preview: string
+  }
 }
 
 export default function ImageSegmentationPage() {
   const [selectedImage, setSelectedImage] = useState<File | null>(null)
   const [imagePreview, setImagePreview] = useState<string | null>(null)
-  const [confidenceThreshold, setConfidenceThreshold] = useState(0.7)
+  const [prompt, setPrompt] = useState("Segment the main objects")
   const [isProcessing, setIsProcessing] = useState(false)
   const [detectedObjects, setDetectedObjects] = useState<DetectedObject[]>([])
   const [selectedObject, setSelectedObject] = useState<DetectedObject | null>(null)
+  const [editingDescription, setEditingDescription] = useState<string | null>(null)
+  const [tempDescription, setTempDescription] = useState("")
+  const [error, setError] = useState<string | null>(null)
+
+  const convertImageToBase64 = (file: File): Promise<string> => {
+    return new Promise((resolve, reject) => {
+      const reader = new FileReader()
+      reader.onload = () => {
+        const result = reader.result as string
+        // Remove the data:image/...;base64, prefix
+        const base64 = result.split(',')[1]
+        resolve(base64)
+      }
+      reader.onerror = reject
+      reader.readAsDataURL(file)
+    })
+  }
+
+  const createCroppedImageUrl = (imageUrl: string, bbox: [number, number, number, number]): Promise<string> => {
+    return new Promise<string>((resolve) => {
+      const canvas = document.createElement('canvas')
+      const ctx = canvas.getContext('2d')
+      const img = new Image()
+      
+      img.onload = () => {
+        const [x, y, width, height] = bbox
+        canvas.width = width
+        canvas.height = height
+        
+        if (ctx) {
+          ctx.drawImage(img, x, y, width, height, 0, 0, width, height)
+          resolve(canvas.toDataURL('image/jpeg'))
+        }
+      }
+      img.src = imageUrl
+    })
+  }
 
   const handleImageUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0]
@@ -40,58 +95,82 @@ export default function ImageSegmentationPage() {
       setImagePreview(URL.createObjectURL(file))
       setDetectedObjects([])
       setSelectedObject(null)
+      setError(null)
     }
   }
 
   const handleSegmentation = async () => {
-    if (!selectedImage) return
+    if (!selectedImage || !imagePreview) return
     
     setIsProcessing(true)
+    setError(null)
     
-    // Simulate API call delay
-    setTimeout(() => {
-      // Mock detected objects data
-      const mockObjects: DetectedObject[] = [
-        {
-          id: "1",
-          label: "Person",
-          confidence: 0.95,
-          bbox: [120, 80, 200, 300],
-          croppedImageUrl: "https://images.unsplash.com/photo-1507003211169-0a1dd7228f2d?w=200&h=300&fit=crop"
+    try {
+      // Convert image to base64
+      const imageBase64 = await convertImageToBase64(selectedImage)
+      
+      // Call the segmentation API through Next.js API route
+      const response = await fetch('/api/segmentation', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
         },
-        {
-          id: "2",
-          label: "Car",
-          confidence: 0.87,
-          bbox: [350, 200, 250, 150],
-          croppedImageUrl: "https://images.unsplash.com/photo-1549317661-bd32c8ce0db2?w=250&h=150&fit=crop"
-        },
-        {
-          id: "3",
-          label: "Building",
-          confidence: 0.82,
-          bbox: [50, 50, 400, 200],
-          croppedImageUrl: "https://images.unsplash.com/photo-1486406146926-c627a92ad1ab?w=400&h=200&fit=crop"
-        },
-        {
-          id: "4",
-          label: "Tree",
-          confidence: 0.78,
-          bbox: [500, 100, 150, 250],
-          croppedImageUrl: "https://images.unsplash.com/photo-1441974231531-c6227db76b6e?w=150&h=250&fit=crop"
-        },
-        {
-          id: "5",
-          label: "Sign",
-          confidence: 0.75,
-          bbox: [200, 350, 100, 80],
-          croppedImageUrl: "https://images.unsplash.com/photo-1560472354-b33ff0c44a43?w=100&h=80&fit=crop"
-        }
-      ].filter(obj => obj.confidence >= confidenceThreshold)
+        body: JSON.stringify({
+          image_base64: imageBase64,
+          prompt: prompt,
+          model: "qwen-vl-plus",
+          temperature: 0.0,
+          top_k: 1,
+          seed: 3407,
+          mime_type: selectedImage.type || "image/jpeg"
+        })
+      })
 
-      setDetectedObjects(mockObjects)
+      if (!response.ok) {
+        const errorData = await response.json().catch(() => ({}))
+        const errorMessage = errorData.error || `API request failed: ${response.status} ${response.statusText}`
+        throw new Error(errorMessage)
+      }
+
+      const data: SegmentationResponse = await response.json()
+      
+      if (!data.success) {
+        throw new Error(data.message || 'Segmentation failed')
+      }
+
+      // Process the results and create cropped images
+      const processedObjects: DetectedObject[] = await Promise.all(
+        data.results.map(async (result, index) => {
+          const croppedImageUrl = await createCroppedImageUrl(imagePreview, result.bbox)
+          return {
+            id: `object-${index}`,
+            bbox: result.bbox,
+            description: result.description,
+            confidence: parseFloat(result.confidence),
+            croppedImageUrl
+          }
+        })
+      )
+
+      setDetectedObjects(processedObjects)
+    } catch (err) {
+      console.error('Segmentation error:', err)
+      let errorMessage = 'An error occurred during segmentation'
+      
+      if (err instanceof Error) {
+        if (err.message.includes('Failed to fetch')) {
+          errorMessage = 'Unable to connect to the segmentation service. Please ensure the backend service is running on port 8000.'
+        } else if (err.message.includes('Backend service error')) {
+          errorMessage = err.message
+        } else {
+          errorMessage = err.message
+        }
+      }
+      
+      setError(errorMessage)
+    } finally {
       setIsProcessing(false)
-    }, 3000)
+    }
   }
 
   const handleObjectSelect = (object: DetectedObject) => {
@@ -99,10 +178,39 @@ export default function ImageSegmentationPage() {
   }
 
   const downloadCroppedImage = (object: DetectedObject) => {
+    if (!object.croppedImageUrl) return
+    
     const link = document.createElement('a')
     link.href = object.croppedImageUrl
-    link.download = `${object.label}_${Math.round(object.confidence * 100)}%.jpg`
+    link.download = `segmented_object_${object.id}_${Math.round(object.confidence * 100)}%.jpg`
     link.click()
+  }
+
+  const startEditingDescription = (objectId: string, currentDescription: string) => {
+    setEditingDescription(objectId)
+    setTempDescription(currentDescription)
+  }
+
+  const saveDescription = (objectId: string) => {
+    setDetectedObjects(prev => 
+      prev.map(obj => 
+        obj.id === objectId 
+          ? { ...obj, description: tempDescription }
+          : obj
+      )
+    )
+    if (selectedObject?.id === objectId) {
+      setSelectedObject(prev => 
+        prev ? { ...prev, description: tempDescription } : null
+      )
+    }
+    setEditingDescription(null)
+    setTempDescription("")
+  }
+
+  const cancelEditingDescription = () => {
+    setEditingDescription(null)
+    setTempDescription("")
   }
 
   return (
@@ -196,44 +304,51 @@ export default function ImageSegmentationPage() {
               </CardContent>
             </Card>
 
-            {/* Confidence Threshold */}
+            {/* Segmentation Prompt */}
             <Card>
               <CardHeader>
                 <CardTitle className="flex items-center gap-2">
                   <Sliders className="h-5 w-5" />
-                  Detection Settings
+                  Segmentation Settings
                 </CardTitle>
                 <CardDescription>
-                  Adjust the confidence threshold for object detection
+                  Configure the segmentation prompt and parameters
                 </CardDescription>
               </CardHeader>
               <CardContent className="space-y-4">
                 <div className="space-y-2">
-                  <div className="flex justify-between text-sm">
-                    <span>Confidence Threshold</span>
-                    <span className="font-medium">{Math.round(confidenceThreshold * 100)}%</span>
-                  </div>
-                  <input
-                    type="range"
-                    min="0.1"
-                    max="1"
-                    step="0.05"
-                    value={confidenceThreshold}
-                    onChange={(e) => setConfidenceThreshold(parseFloat(e.target.value))}
-                    className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer slider"
+                  <label htmlFor="prompt" className="text-sm font-medium">
+                    Segmentation Prompt
+                  </label>
+                  <textarea
+                    id="prompt"
+                    value={prompt}
+                    onChange={(e) => setPrompt(e.target.value)}
+                    className="w-full p-3 border border-gray-300 rounded-md resize-none"
+                    rows={3}
+                    placeholder="Enter your segmentation prompt..."
                   />
-                  <div className="flex justify-between text-xs text-gray-500">
-                    <span>10%</span>
-                    <span>100%</span>
-                  </div>
                 </div>
                 
                 <div className="text-sm text-gray-600">
-                  <p>• Higher threshold = Fewer but more confident detections</p>
-                  <p>• Lower threshold = More detections but less confident</p>
+                  <p>• Describe what you want to segment in the image</p>
+                  <p>• Be specific about the object or area of interest</p>
                 </div>
               </CardContent>
             </Card>
+
+            {/* Error Display */}
+            {error && (
+              <Card className="border-red-200 bg-red-50">
+                <CardContent className="pt-6">
+                  <div className="flex items-center gap-2 text-red-600">
+                    <X className="h-4 w-4" />
+                    <span className="font-medium">Error:</span>
+                    <span>{error}</span>
+                  </div>
+                </CardContent>
+              </Card>
+            )}
 
             {/* Detection Results Summary */}
             {detectedObjects.length > 0 && (
@@ -241,10 +356,10 @@ export default function ImageSegmentationPage() {
                 <CardHeader>
                   <CardTitle className="flex items-center gap-2">
                     <Eye className="h-5 w-5" />
-                    Detection Summary
+                    Segmentation Summary
                   </CardTitle>
                   <CardDescription>
-                    Overview of detected objects
+                    Overview of segmented objects
                   </CardDescription>
                 </CardHeader>
                 <CardContent>
@@ -264,6 +379,10 @@ export default function ImageSegmentationPage() {
                       <Badge variant="default">
                         {Math.round(Math.max(...detectedObjects.map(obj => obj.confidence)) * 100)}%
                       </Badge>
+                    </div>
+                    <div className="flex justify-between items-center">
+                      <span className="text-sm font-medium">Status:</span>
+                      <Badge variant="default">Segmentation Complete</Badge>
                     </div>
                   </div>
                 </CardContent>
@@ -288,18 +407,16 @@ export default function ImageSegmentationPage() {
                 <CardContent>
                   <div className="space-y-4">
                     <div className="text-center">
-                      <img
-                        src={selectedObject.croppedImageUrl}
-                        alt={`Detailed ${selectedObject.label}`}
-                        className="mx-auto max-h-48 rounded-lg shadow-md"
-                      />
+                      {selectedObject.croppedImageUrl && (
+                        <img
+                          src={selectedObject.croppedImageUrl}
+                          alt={`Detailed object ${selectedObject.id}`}
+                          className="mx-auto max-h-48 rounded-lg shadow-md"
+                        />
+                      )}
                     </div>
                     
                     <div className="space-y-3">
-                      <div className="flex justify-between">
-                        <span className="font-medium">Label:</span>
-                        <span className="text-gray-600">{selectedObject.label}</span>
-                      </div>
                       <div className="flex justify-between">
                         <span className="font-medium">Confidence:</span>
                         <Badge variant="secondary">
@@ -312,6 +429,12 @@ export default function ImageSegmentationPage() {
                           X: {selectedObject.bbox[0]}, Y: {selectedObject.bbox[1]}, 
                           W: {selectedObject.bbox[2]}, H: {selectedObject.bbox[3]}
                         </span>
+                      </div>
+                      <div className="space-y-2">
+                        <span className="font-medium">Description:</span>
+                        <p className="text-gray-600 text-sm bg-gray-50 p-3 rounded-md">
+                          {selectedObject.description}
+                        </p>
                       </div>
                     </div>
                     
@@ -336,8 +459,8 @@ export default function ImageSegmentationPage() {
                 </CardTitle>
                 <CardDescription>
                   {detectedObjects.length > 0 
-                    ? `Found ${detectedObjects.length} objects above ${Math.round(confidenceThreshold * 100)}% confidence` 
-                    : "Upload an image and adjust settings to detect objects"
+                    ? `Found ${detectedObjects.length} segmented objects` 
+                    : "Upload an image and configure settings to segment objects"
                   }
                 </CardDescription>
               </CardHeader>
@@ -356,31 +479,90 @@ export default function ImageSegmentationPage() {
                       >
                         <div className="space-y-2">
                           <div className="flex items-center justify-between">
-                            <h3 className="font-medium text-sm">{object.label}</h3>
-                            <Button
-                              size="sm"
-                              variant="ghost"
-                              className="h-6 w-6 p-0 hover:bg-gray-100"
-                              onClick={(e) => {
-                                e.stopPropagation()
-                                downloadCroppedImage(object)
-                              }}
-                            >
-                              <Download className="h-3 w-3" />
-                            </Button>
+                            <h3 className="font-medium text-sm">Object {object.id.split('-')[1]}</h3>
+                            <div className="flex gap-1">
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                className="h-6 w-6 p-0 hover:bg-gray-100"
+                                onClick={(e) => {
+                                  e.stopPropagation()
+                                  startEditingDescription(object.id, object.description)
+                                }}
+                              >
+                                <Edit3 className="h-3 w-3" />
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                className="h-6 w-6 p-0 hover:bg-gray-100"
+                                onClick={(e) => {
+                                  e.stopPropagation()
+                                  downloadCroppedImage(object)
+                                }}
+                              >
+                                <Download className="h-3 w-3" />
+                              </Button>
+                            </div>
                           </div>
                           
                           <div className="relative">
-                            <img
-                              src={object.croppedImageUrl}
-                              alt={`Cropped ${object.label}`}
-                              className="w-full h-24 object-cover rounded-md"
-                            />
+                            {object.croppedImageUrl && (
+                              <img
+                                src={object.croppedImageUrl}
+                                alt={`Cropped object ${object.id}`}
+                                className="w-full h-24 object-cover rounded-md"
+                              />
+                            )}
                             <div className="absolute top-1 right-1">
                               <Badge variant="secondary" className="text-xs bg-white/90 text-black">
                                 {Math.round(object.confidence * 100)}%
                               </Badge>
                             </div>
+                          </div>
+                          
+                          <div className="space-y-2">
+                            {editingDescription === object.id ? (
+                              <div className="space-y-2">
+                                <textarea
+                                  value={tempDescription}
+                                  onChange={(e) => setTempDescription(e.target.value)}
+                                  className="w-full text-xs p-2 border rounded-md resize-none"
+                                  rows={3}
+                                  onClick={(e) => e.stopPropagation()}
+                                />
+                                <div className="flex gap-1">
+                                  <Button
+                                    size="sm"
+                                    variant="ghost"
+                                    className="h-6 px-2 text-xs"
+                                    onClick={(e) => {
+                                      e.stopPropagation()
+                                      saveDescription(object.id)
+                                    }}
+                                  >
+                                    <Check className="h-3 w-3 mr-1" />
+                                    Save
+                                  </Button>
+                                  <Button
+                                    size="sm"
+                                    variant="ghost"
+                                    className="h-6 px-2 text-xs"
+                                    onClick={(e) => {
+                                      e.stopPropagation()
+                                      cancelEditingDescription()
+                                    }}
+                                  >
+                                    <X className="h-3 w-3 mr-1" />
+                                    Cancel
+                                  </Button>
+                                </div>
+                              </div>
+                            ) : (
+                              <div className="text-xs text-gray-600 bg-gray-50 p-2 rounded-md">
+                                {object.description}
+                              </div>
+                            )}
                           </div>
                           
                           <div className="text-xs text-gray-500">
