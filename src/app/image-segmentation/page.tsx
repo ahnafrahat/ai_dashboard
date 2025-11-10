@@ -19,6 +19,7 @@ import {
   X
 } from "lucide-react"
 import Link from "next/link"
+import { useRouter } from "next/navigation"
 
 interface DetectedObject {
   id: string
@@ -28,38 +29,51 @@ interface DetectedObject {
   croppedImageUrl?: string
 }
 
-interface SegmentationResponse {
+interface SegmentationV2Response {
   success: boolean
   message: string
-  results: Array<{
-    bbox: [number, number, number, number]
-    description: string
-    confidence: string
+  detections: Array<{
+    bbox: [number, number, number, number] // v2 returns [x1, y1, x2, y2]
+    label: string
+    confidence: number
   }>
-  raw_output: string
-  debug_info: {
-    text_length: number
-    text_preview: string
+  result_image?: string
+  raw_output?: {
+    detections: Array<{
+      bbox: [number, number, number, number]
+      label: string
+      confidence: number
+    }>
+    result_image?: string
   }
 }
 
 export default function ImageSegmentationPage() {
+  const router = useRouter()
   const [selectedImage, setSelectedImage] = useState<File | null>(null)
   const [imagePreview, setImagePreview] = useState<string | null>(null)
-  const [prompt, setPrompt] = useState("Segment the main objects")
+  const [prompt, setPrompt] = useState("Segment only wearable clothings")
+  const [boxThreshold, setBoxThreshold] = useState<number>(0.2)
+  const [textThreshold, setTextThreshold] = useState<number>(0.2)
+  const [showVisualisation, setShowVisualisation] = useState<boolean>(true)
   const [isProcessing, setIsProcessing] = useState(false)
   const [detectedObjects, setDetectedObjects] = useState<DetectedObject[]>([])
   const [selectedObject, setSelectedObject] = useState<DetectedObject | null>(null)
   const [editingDescription, setEditingDescription] = useState<string | null>(null)
   const [tempDescription, setTempDescription] = useState("")
   const [error, setError] = useState<string | null>(null)
+  const [isUploading, setIsUploading] = useState(false)
+  const [uploadedImageUrl, setUploadedImageUrl] = useState<string | null>(null)
+  const [isResultModalOpen, setIsResultModalOpen] = useState(false)
+  const [apiResult, setApiResult] = useState<any>(null)
+  const [apiResultError, setApiResultError] = useState<string | null>(null)
 
+  // No longer needed to convert to base64 for v2; keeping helper unused
   const convertImageToBase64 = (file: File): Promise<string> => {
     return new Promise((resolve, reject) => {
       const reader = new FileReader()
       reader.onload = () => {
         const result = reader.result as string
-        // Remove the data:image/...;base64, prefix
         const base64 = result.split(',')[1]
         resolve(base64)
       }
@@ -106,24 +120,17 @@ export default function ImageSegmentationPage() {
     setError(null)
     
     try {
-      // Convert image to base64
-      const imageBase64 = await convertImageToBase64(selectedImage)
-      
-      // Call the segmentation API through Next.js API route
+      // Call the segmentation API through Next.js API route with multipart/form-data
+      const fd = new FormData()
+      fd.append('image', selectedImage)
+      fd.append('prompt', prompt)
+      fd.append('box_threshold', String(boxThreshold))
+      fd.append('text_threshold', String(textThreshold))
+      fd.append('show_visualisation', String(showVisualisation))
+
       const response = await fetch('/api/segmentation', {
         method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          image_base64: imageBase64,
-          prompt: prompt,
-          model: "qwen-vl-plus",
-          temperature: 0.0,
-          top_k: 1,
-          seed: 3407,
-          mime_type: selectedImage.type || "image/jpeg"
-        })
+        body: fd
       })
 
       if (!response.ok) {
@@ -132,21 +139,23 @@ export default function ImageSegmentationPage() {
         throw new Error(errorMessage)
       }
 
-      const data: SegmentationResponse = await response.json()
+      const data: SegmentationV2Response = await response.json()
       
       if (!data.success) {
         throw new Error(data.message || 'Segmentation failed')
       }
 
-      // Process the results and create cropped images
+      // Map v2 detections [x1,y1,x2,y2] -> [x,y,w,h]
       const processedObjects: DetectedObject[] = await Promise.all(
-        data.results.map(async (result, index) => {
-          const croppedImageUrl = await createCroppedImageUrl(imagePreview, result.bbox)
+        (data.detections || []).map(async (det, index) => {
+          const [x1, y1, x2, y2] = det.bbox
+          const bboxTransformed: [number, number, number, number] = [x1, y1, Math.max(0, x2 - x1), Math.max(0, y2 - y1)]
+          const croppedImageUrl = await createCroppedImageUrl(imagePreview, bboxTransformed)
           return {
             id: `object-${index}`,
-            bbox: result.bbox,
-            description: result.description,
-            confidence: parseFloat(result.confidence),
+            bbox: bboxTransformed,
+            description: det.label,
+            confidence: det.confidence,
             croppedImageUrl
           }
         })
@@ -213,6 +222,56 @@ export default function ImageSegmentationPage() {
     setTempDescription("")
   }
 
+  const handleProceedSelected = async () => {
+    if (!selectedObject || !selectedObject.croppedImageUrl) return
+    try {
+      setIsUploading(true)
+      setApiResult(null)
+      setApiResultError(null)
+      // Convert the data URL to a Blob
+      const dataUrl = selectedObject.croppedImageUrl
+      const res = await fetch(dataUrl)
+      const blob = await res.blob()
+
+      // Compose FormData with a File-like Blob
+      const formData = new FormData()
+      const filename = `selected_${selectedObject.id}.png`
+      const file = new File([blob], filename, { type: blob.type || 'image/png' })
+      formData.append('image', file)
+      formData.append('description', selectedObject.description || 'Image from segmentation tool')
+
+      // Call the provided local API endpoint
+      const uploadResponse = await fetch('http://127.0.0.1:8000/savedatatodb', {
+        method: 'POST',
+        body: formData
+      })
+
+      if (!uploadResponse.ok) {
+        const errText = await uploadResponse.text().catch(() => '')
+        throw new Error(`API request failed: ${uploadResponse.status} ${uploadResponse.statusText} ${errText}`)
+      }
+
+      // Try parse JSON; fallback to text
+      let result: any = null
+      const text = await uploadResponse.text()
+      try {
+        result = JSON.parse(text)
+      } catch {
+        result = { message: text }
+      }
+
+      setApiResult(result)
+      setIsResultModalOpen(true)
+    } catch (e) {
+      console.error('Failed to proceed with selected image', e)
+      const message = e instanceof Error ? e.message : 'Unknown error'
+      setApiResultError(message)
+      setIsResultModalOpen(true)
+    } finally {
+      setIsUploading(false)
+    }
+  }
+
   return (
     <div className="min-h-screen bg-gray-50">
       {/* Header */}
@@ -239,6 +298,31 @@ export default function ImageSegmentationPage() {
 
       {/* Main Content */}
       <main className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-8">
+        {isResultModalOpen && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center">
+            <div className="absolute inset-0 bg-black/50" onClick={() => setIsResultModalOpen(false)} />
+            <div className="relative bg-white rounded-lg shadow-xl max-w-lg w-full mx-4 p-6">
+              <div className="flex items-center justify-between mb-4">
+                <h2 className="text-lg font-semibold">API Response</h2>
+                <button className="text-gray-500 hover:text-gray-700" onClick={() => setIsResultModalOpen(false)}>
+                  ✕
+                </button>
+              </div>
+              <div className="max-h-[60vh] overflow-auto text-sm">
+                {apiResultError ? (
+                  <div className="text-red-600">{apiResultError}</div>
+                ) : (
+                  <pre className="whitespace-pre-wrap break-words bg-gray-50 p-3 rounded border border-gray-200">
+                    {JSON.stringify(apiResult, null, 2)}
+                  </pre>
+                )}
+              </div>
+              <div className="mt-4 text-right">
+                <Button onClick={() => setIsResultModalOpen(false)}>Close</Button>
+              </div>
+            </div>
+          </div>
+        )}
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
           {/* Left Side - Image Upload and Settings */}
           <div className="space-y-6">
@@ -329,6 +413,49 @@ export default function ImageSegmentationPage() {
                     placeholder="Enter your segmentation prompt..."
                   />
                 </div>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+                  <div>
+                    <label htmlFor="box-threshold" className="text-sm font-medium">
+                      Box Threshold: {boxThreshold.toFixed(2)}
+                    </label>
+                    <input
+                      id="box-threshold"
+                      type="range"
+                      min={0}
+                      max={1}
+                      step={0.01}
+                      value={boxThreshold}
+                      onChange={(e) => setBoxThreshold(parseFloat(e.target.value))}
+                      className="w-full"
+                    />
+                  </div>
+                  <div>
+                    <label htmlFor="text-threshold" className="text-sm font-medium">
+                      Text Threshold: {textThreshold.toFixed(2)}
+                    </label>
+                    <input
+                      id="text-threshold"
+                      type="range"
+                      min={0}
+                      max={1}
+                      step={0.01}
+                      value={textThreshold}
+                      onChange={(e) => setTextThreshold(parseFloat(e.target.value))}
+                      className="w-full"
+                    />
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <input
+                    id="show-visualisation"
+                    type="checkbox"
+                    checked={showVisualisation}
+                    onChange={(e) => setShowVisualisation(e.target.checked)}
+                  />
+                  <label htmlFor="show-visualisation" className="text-sm font-medium">
+                    Show Visualisation
+                  </label>
+                </div>
                 
                 <div className="text-sm text-gray-600">
                   <p>• Describe what you want to segment in the image</p>
@@ -414,6 +541,11 @@ export default function ImageSegmentationPage() {
                           className="mx-auto max-h-48 rounded-lg shadow-md"
                         />
                       )}
+                      {uploadedImageUrl && (
+                        <div className="mt-3 text-xs text-green-700 break-all">
+                          Uploaded URL: {uploadedImageUrl}
+                        </div>
+                      )}
                     </div>
                     
                     <div className="space-y-3">
@@ -431,20 +563,70 @@ export default function ImageSegmentationPage() {
                         </span>
                       </div>
                       <div className="space-y-2">
-                        <span className="font-medium">Description:</span>
-                        <p className="text-gray-600 text-sm bg-gray-50 p-3 rounded-md">
-                          {selectedObject.description}
-                        </p>
+                        <div className="flex items-center justify-between">
+                          <span className="font-medium">Description:</span>
+                          {editingDescription !== selectedObject.id && (
+                            <Button 
+                              size="sm" 
+                              variant="ghost" 
+                              className="h-7 px-2 text-xs"
+                              onClick={() => startEditingDescription(selectedObject.id, selectedObject.description)}
+                            >
+                              <Edit3 className="h-3 w-3 mr-1" /> Edit
+                            </Button>
+                          )}
+                        </div>
+                        {editingDescription === selectedObject.id ? (
+                          <div className="space-y-2">
+                            <textarea
+                              value={tempDescription}
+                              onChange={(e) => setTempDescription(e.target.value)}
+                              className="w-full text-sm p-2 border rounded-md resize-none"
+                              rows={3}
+                            />
+                            <div className="flex gap-2">
+                              <Button
+                                size="sm"
+                                variant="default"
+                                className="h-7 px-3 text-xs"
+                                onClick={() => saveDescription(selectedObject.id)}
+                              >
+                                <Check className="h-3 w-3 mr-1" /> Save
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="ghost"
+                                className="h-7 px-3 text-xs"
+                                onClick={cancelEditingDescription}
+                              >
+                                <X className="h-3 w-3 mr-1" /> Cancel
+                              </Button>
+                            </div>
+                          </div>
+                        ) : (
+                          <p className="text-gray-600 text-sm bg-gray-50 p-3 rounded-md">
+                            {selectedObject.description}
+                          </p>
+                        )}
                       </div>
                     </div>
                     
-                    <Button 
-                      onClick={() => downloadCroppedImage(selectedObject)}
-                      className="w-full"
-                    >
-                      <Download className="h-4 w-4 mr-2" />
-                      Download Cropped Image
-                    </Button>
+                    <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+                      <Button 
+                        onClick={() => downloadCroppedImage(selectedObject)}
+                        className="w-full"
+                      >
+                        <Download className="h-4 w-4 mr-2" />
+                        Download
+                      </Button>
+                      <Button 
+                        onClick={handleProceedSelected}
+                        className="w-full"
+                        disabled={isUploading}
+                      >
+                        {isUploading ? 'Uploading...' : 'Proceed Selected Image'}
+                      </Button>
+                    </div>
                   </div>
                 </CardContent>
               </Card>

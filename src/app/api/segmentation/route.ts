@@ -2,24 +2,21 @@ import { NextRequest, NextResponse } from 'next/server'
 
 export async function POST(request: NextRequest) {
   try {
-    const body = await request.json()
+    const formData = await request.formData()
     
     // Validate required fields
-    if (!body.image_base64) {
+    if (!formData.get('image')) {
       return NextResponse.json(
-        { error: 'image_base64 is required' },
+        { error: 'image file is required' },
         { status: 400 }
       )
     }
 
     // Forward the request to your backend service
     const backendUrl = process.env.BACKEND_URL || 'http://127.0.0.1:8000'
-    const response = await fetch(`${backendUrl}/segmentation`, {
+    const response = await fetch(`${backendUrl}/segmentation-v2`, {
       method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-      },
-      body: JSON.stringify(body),
+      body: formData,
     })
 
     if (!response.ok) {

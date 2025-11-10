@@ -1,6 +1,6 @@
 "use client"
 
-import { useState } from "react"
+import { useEffect, useState } from "react"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Button } from "@/components/ui/button"
 import { Badge } from "@/components/ui/badge"
@@ -16,73 +16,130 @@ import {
 } from "lucide-react"
 import Link from "next/link"
 
+// Types for the API
+interface SimilarityResult {
+  id: string
+  score: number
+  payload: {
+    description: string
+    url: string
+    objectImageUrl: string
+    createdAt: string
+    updatedAt: string
+  }
+}
+
+interface SimilaritySearchResponse {
+  success: boolean
+  message: string
+  model_used: string
+  query_embedding_size: number
+  results: SimilarityResult[]
+  search_params: {
+    limit: number
+    score_threshold: number | null
+  }
+}
+
 export default function ImageSimilarityPage() {
   const [selectedImage, setSelectedImage] = useState<File | null>(null)
-  const [confidenceThreshold, setConfidenceThreshold] = useState(0.8)
+  const [selectedImageDataUrl, setSelectedImageDataUrl] = useState<string | null>(null)
+  const [uploadedImageUrl, setUploadedImageUrl] = useState<string | null>(null)
+  const [confidenceThreshold, setConfidenceThreshold] = useState(0.6)
   const [isSearching, setIsSearching] = useState(false)
-  const [similarImages, setSimilarImages] = useState<Array<{
-    id: string
-    url: string
-    similarity: number
-    tags: string[]
-  }>>([])
+  const [similarImages, setSimilarImages] = useState<SimilarityResult[]>([])
+  const [selectedModel, setSelectedModel] = useState<'v2' | 'v3'>('v2')
+  const [searchLimit, setSearchLimit] = useState(15)
+  const [searchResults, setSearchResults] = useState<SimilaritySearchResponse | null>(null)
 
   const handleImageUpload = (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0]
     if (file) {
       setSelectedImage(file)
+      setSelectedImageDataUrl(null)
     }
   }
 
   const handleSearch = async () => {
-    if (!selectedImage) return
+    if (!selectedImage && !selectedImageDataUrl) return
     
     setIsSearching(true)
+    setSearchResults(null)
     
-    // Simulate API call delay
-    setTimeout(() => {
-      // Mock similar images data
-      setSimilarImages([
-        {
-          id: "1",
-          url: "https://images.unsplash.com/photo-1506905925346-21bda4d32df4?w=300&h=300&fit=crop",
-          similarity: 0.95,
-          tags: ["nature", "landscape", "mountain"]
+    try {
+      // Convert image to base64
+      let imageBase64: string
+      
+      if (selectedImage) {
+        imageBase64 = await new Promise<string>((resolve, reject) => {
+          const reader = new FileReader()
+          reader.onload = () => {
+            const result = reader.result as string
+            // Remove data:image/...;base64, prefix
+            const base64 = result.split(',')[1]
+            resolve(base64)
+          }
+          reader.onerror = reject
+          reader.readAsDataURL(selectedImage)
+        })
+      } else if (selectedImageDataUrl) {
+        // Remove data:image/...;base64, prefix
+        imageBase64 = selectedImageDataUrl.split(',')[1]
+      } else {
+        throw new Error('No image selected')
+      }
+
+      // Call the API
+      const response = await fetch('http://localhost:8000/image-similarity-search', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
         },
-        {
-          id: "2",
-          url: "https://images.unsplash.com/photo-1441974231531-c6227db76b6e?w=300&h=300&fit=crop",
-          similarity: 0.87,
-          tags: ["forest", "trees", "green"]
-        },
-        {
-          id: "3",
-          url: "https://images.unsplash.com/photo-1506905925346-21bda4d32df4?w=300&h=300&fit=crop",
-          similarity: 0.82,
-          tags: ["outdoor", "scenery", "panorama"]
-        },
-        {
-          id: "4",
-          url: "https://images.unsplash.com/photo-1441974231531-c6227db76b6e?w=300&h=300&fit=crop",
-          similarity: 0.78,
-          tags: ["wilderness", "adventure", "exploration"]
-        },
-        {
-          id: "5",
-          url: "https://images.unsplash.com/photo-1506905925346-21bda4d32df4?w=300&h=300&fit=crop",
-          similarity: 0.75,
-          tags: ["travel", "photography", "nature"]
-        },
-        {
-          id: "6",
-          url: "https://images.unsplash.com/photo-1441974231531-c6227db76b6e?w=300&h=300&fit=crop",
-          similarity: 0.72,
-          tags: ["outdoor", "landscape", "beauty"]
-        }
-      ])
+        body: JSON.stringify({
+          image: imageBase64,
+          model: selectedModel,
+          limit: searchLimit,
+          score_threshold: confidenceThreshold
+        }),
+      })
+
+      if (!response.ok) {
+        const errorData = await response.json()
+        throw new Error(errorData.error || `HTTP error! status: ${response.status}`)
+      }
+
+      const data: SimilaritySearchResponse = await response.json()
+      
+      if (data.success) {
+        setSearchResults(data)
+        setSimilarImages(data.results)
+      } else {
+        throw new Error(data.message || 'Search failed')
+      }
+    } catch (error) {
+      console.error('Search error:', error)
+      alert(`Search failed: ${error instanceof Error ? error.message : 'Unknown error'}`)
+      setSimilarImages([])
+    } finally {
       setIsSearching(false)
-    }, 2000)
+    }
   }
+
+  useEffect(() => {
+    try {
+      const raw = sessionStorage.getItem('similarity:selectedImage')
+      if (!raw) return
+      const parsed = JSON.parse(raw)
+      if (parsed?.imageDataUrl) {
+        setSelectedImageDataUrl(parsed.imageDataUrl as string)
+      }
+      if (parsed?.uploadedUrl) {
+        setUploadedImageUrl(parsed.uploadedUrl as string)
+      }
+    } catch (e) {
+      // noop
+    }
+  }, [])
 
   return (
     <div className="min-h-screen bg-gray-50">
@@ -134,14 +191,17 @@ export default function ImageSimilarityPage() {
                     id="image-upload"
                   />
                   <label htmlFor="image-upload" className="cursor-pointer">
-                    {selectedImage ? (
+                    {selectedImage || selectedImageDataUrl ? (
                       <div className="space-y-2">
                         <img
-                          src={URL.createObjectURL(selectedImage)}
+                          src={selectedImage ? URL.createObjectURL(selectedImage) : (selectedImageDataUrl as string)}
                           alt="Selected"
                           className="mx-auto max-h-48 rounded-lg"
                         />
-                        <p className="text-sm text-gray-600">{selectedImage.name}</p>
+                        <p className="text-sm text-gray-600">{selectedImage ? selectedImage.name : 'Image from segmentation'}</p>
+                        {uploadedImageUrl && (
+                          <p className="text-xs text-green-700 break-all">Uploaded URL: {uploadedImageUrl}</p>
+                        )}
                       </div>
                     ) : (
                       <div className="space-y-2">
@@ -157,7 +217,7 @@ export default function ImageSimilarityPage() {
                 
                 <Button 
                   onClick={handleSearch} 
-                  disabled={!selectedImage || isSearching}
+                  disabled={(!selectedImage && !selectedImageDataUrl) || isSearching}
                   className="w-full"
                 >
                   {isSearching ? (
@@ -175,7 +235,7 @@ export default function ImageSimilarityPage() {
               </CardContent>
             </Card>
 
-            {/* Confidence Threshold */}
+            {/* Search Settings */}
             <Card>
               <CardHeader>
                 <CardTitle className="flex items-center gap-2">
@@ -183,13 +243,62 @@ export default function ImageSimilarityPage() {
                   Search Settings
                 </CardTitle>
                 <CardDescription>
-                  Adjust the confidence threshold for image similarity
+                  Configure the image similarity search parameters
                 </CardDescription>
               </CardHeader>
-              <CardContent className="space-y-4">
+              <CardContent className="space-y-6">
+                {/* Model Selection */}
+                <div className="space-y-2">
+                  <label className="text-sm font-medium">Model Version</label>
+                  <div className="flex space-x-4">
+                    <label className="flex items-center space-x-2">
+                      <input
+                        type="radio"
+                        value="v2"
+                        checked={selectedModel === 'v2'}
+                        onChange={(e) => setSelectedModel(e.target.value as 'v2' | 'v3')}
+                        className="text-purple-600"
+                      />
+                      <span className="text-sm">V2</span>
+                    </label>
+                    <label className="flex items-center space-x-2">
+                      <input
+                        type="radio"
+                        value="v3"
+                        checked={selectedModel === 'v3'}
+                        onChange={(e) => setSelectedModel(e.target.value as 'v2' | 'v3')}
+                        className="text-purple-600"
+                      />
+                      <span className="text-sm">V3</span>
+                    </label>
+                  </div>
+                </div>
+
+                {/* Search Limit */}
                 <div className="space-y-2">
                   <div className="flex justify-between text-sm">
-                    <span>Confidence Threshold</span>
+                    <span>Search Limit</span>
+                    <span className="font-medium">{searchLimit}</span>
+                  </div>
+                  <input
+                    type="range"
+                    min="1"
+                    max="50"
+                    step="1"
+                    value={searchLimit}
+                    onChange={(e) => setSearchLimit(parseInt(e.target.value))}
+                    className="w-full h-2 bg-gray-200 rounded-lg appearance-none cursor-pointer slider"
+                  />
+                  <div className="flex justify-between text-xs text-gray-500">
+                    <span>1</span>
+                    <span>50</span>
+                  </div>
+                </div>
+
+                {/* Score Threshold */}
+                <div className="space-y-2">
+                  <div className="flex justify-between text-sm">
+                    <span>Score Threshold</span>
                     <span className="font-medium">{Math.round(confidenceThreshold * 100)}%</span>
                   </div>
                   <input
@@ -224,10 +333,20 @@ export default function ImageSimilarityPage() {
                   Similar Images
                 </CardTitle>
                 <CardDescription>
-                  {similarImages.length > 0 
-                    ? `Found ${similarImages.length} similar images` 
-                    : "Upload an image and adjust settings to find similar images"
-                  }
+                  {searchResults ? (
+                    <div className="space-y-1">
+                      <p>{searchResults.message}</p>
+                      <p className="text-xs text-gray-500">
+                        Model: {searchResults.model_used} | 
+                        Embedding Size: {searchResults.query_embedding_size} | 
+                        Results: {searchResults.results.length}
+                      </p>
+                    </div>
+                  ) : similarImages.length > 0 ? (
+                    `Found ${similarImages.length} similar images`
+                  ) : (
+                    "Upload an image and adjust settings to find similar images"
+                  )}
                 </CardDescription>
               </CardHeader>
               <CardContent>
@@ -237,22 +356,31 @@ export default function ImageSimilarityPage() {
                       <div key={image.id} className="space-y-2">
                         <div className="relative group">
                           <img
-                            src={image.url}
-                            alt="Similar image"
+                            src={image.payload.url || image.payload.objectImageUrl}
+                            alt={image.payload.description || "Similar image"}
                             className="w-full h-32 object-cover rounded-lg group-hover:scale-105 transition-transform duration-200"
+                            onError={(e) => {
+                              // Fallback to objectImageUrl if url fails
+                              const target = e.target as HTMLImageElement
+                              if (target.src !== image.payload.objectImageUrl) {
+                                target.src = image.payload.objectImageUrl
+                              }
+                            }}
                           />
                           <div className="absolute top-2 right-2">
                             <Badge variant="secondary" className="bg-white/90 text-black">
-                              {Math.round(image.similarity * 100)}%
+                              {Math.round(image.score * 100)}%
                             </Badge>
                           </div>
                         </div>
-                        <div className="flex flex-wrap gap-1">
-                          {image.tags.map((tag, index) => (
-                            <Badge key={index} variant="outline" className="text-xs">
-                              {tag}
-                            </Badge>
-                          ))}
+                        <div className="space-y-1">
+                          <p className="text-xs text-gray-600 line-clamp-2">
+                            {image.payload.description || 'No description'}
+                          </p>
+                          <div className="flex justify-between text-xs text-gray-500">
+                            <span>ID: {image.id.slice(0, 8)}...</span>
+                            <span>{new Date(image.payload.createdAt).toLocaleDateString()}</span>
+                          </div>
                         </div>
                       </div>
                     ))}

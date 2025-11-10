@@ -1,5 +1,6 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
+import Link from "next/link";
 import "./globals.css";
 
 const geist = Geist({
@@ -27,6 +28,30 @@ export default function RootLayout({
       <body
         className={`${geist.variable} ${geistMono.variable} antialiased`}
       >
+        <header className="bg-white shadow-sm border-b">
+          <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8">
+            <nav className="flex items-center justify-between h-16">
+              <div className="font-semibold text-gray-900">HelloShop AI</div>
+              <ul className="flex items-center gap-6 text-sm">
+                <li>
+                  <Link className="text-gray-700 hover:text-gray-900" href="/image-similarity">
+                    Image Similarity Search
+                  </Link>
+                </li>
+                <li>
+                  <Link className="text-gray-700 hover:text-gray-900" href="/image-segmentation">
+                    Image Segmentation
+                  </Link>
+                </li>
+                <li>
+                  <Link className="text-gray-700 hover:text-gray-900" href="/image-gallery">
+                    Image Gallery
+                  </Link>
+                </li>
+              </ul>
+            </nav>
+          </div>
+        </header>
         {children}
       </body>
     </html>
